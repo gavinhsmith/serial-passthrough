@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.16)
+project(serial-passthrough C)
+
+set(CMAKE_C_STANDARD 11)
+if(MSVC)
+  add_compile_options(/W4 /D_CRT_SECURE_NO_WARNINGS)
+else()
+  add_compile_options(-Wall -Wextra)
+endif()
+
+add_executable(serial-passthrough src/main.c src/serial.c src/packet.c)
+if(WIN32)
+  target_link_libraries(serial-passthrough winmm)
+endif()
+install(TARGETS serial-passthrough)
+
+enable_testing()
+add_executable(test_packet tests/test_packet.c src/packet.c)
+target_include_directories(test_packet PRIVATE src)
+add_test(NAME packet COMMAND test_packet)
+
+find_program(SOCAT socat)
+if(SOCAT AND NOT WIN32)
+  add_test(NAME passthrough COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/passthrough.sh $<TARGET_FILE:serial-passthrough>)
+endif()
