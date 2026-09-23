@@ -8,14 +8,14 @@ else()
   add_compile_options(-Wall -Wextra)
 endif()
 
-add_executable(serial-passthrough src/main.c src/serial.c src/packet.c)
+add_executable(serial-passthrough src/main.c src/serial.c src/packet.c src/template.c)
 if(WIN32)
   target_link_libraries(serial-passthrough winmm)
 endif()
 install(TARGETS serial-passthrough)
 
 enable_testing()
-add_executable(test_packet tests/test_packet.c src/packet.c)
+add_executable(test_packet tests/test_packet.c src/packet.c src/template.c)
 target_include_directories(test_packet PRIVATE src)
 add_test(NAME packet COMMAND test_packet)
 

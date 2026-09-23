@@ -30,10 +30,12 @@ static int parse_field(struct spec *s, char *tok, char *err, size_t errlen)
     if (find(s, tok, strlen(tok)) >= 0) FAIL("duplicate field '%s'", tok);
     strcpy(f->name, tok);
 
-    if (type[0] == 'u') {
+    if (s->n && s->f[s->n - 1].rest) FAIL("%s: nothing can follow a (*) field", tok);
+    if (type[0] == 'u' || type[0] == 'i') {
         long bits = strtol(type + 1, &end, 10);
-        if (bits != 8 && bits != 16 && bits != 32) FAIL("%s: integer type must be u8, u16 or u32", tok);
+        if (bits != 8 && bits != 16 && bits != 32) FAIL("%s: integer type must be u8/i8, u16/i16 or u32/i32", tok);
         f->width = (int)bits / 8;
+        f->sign = type[0] == 'i';
         if (!strcmp(end, "be")) f->be = 1;
         else if (*end && strcmp(end, "le")) FAIL("%s: unknown byte order '%s'", tok, end);
     } else if (!strncmp(type, "bytes(", 6) || !strncmp(type, "text(", 5)) {
@@ -41,7 +43,9 @@ static int parse_field(struct spec *s, char *tok, char *err, size_t errlen)
         f->text = type[0] == 't';
         if (!close || close[1]) FAIL("%s: expected %s(size)", tok, f->text ? "text" : "bytes");
         *close = '\0';
-        if (isdigit((unsigned char)*arg)) {
+        if (!strcmp(arg, "*")) {
+            f->rest = 1;
+        } else if (isdigit((unsigned char)*arg)) {
             unsigned long c = strtoul(arg, &end, 10);
             if (*end || c == 0 || c > PKT_MAX_LEN) FAIL("%s: size must be 1..%d", tok, PKT_MAX_LEN);
             f->count = c;
@@ -113,11 +117,12 @@ static void wr(uint8_t *p, int w, int be, uint32_t v)
     for (int i = 0; i < w; i++) p[be ? w - 1 - i : i] = (uint8_t)(v >> (8 * i));
 }
 
-/* Byte length of a field given the integer values before it; -1 if out of range. */
-static long flen(const struct field *f, const uint32_t *v)
+/* Byte length of a field given the integer values before it and the bytes left; -1 if out of range. */
+static long flen(const struct field *f, const uint32_t *v, size_t left)
 {
     long long l;
     if (f->width) return f->width;
+    if (f->rest) return left > PKT_MAX_LEN ? -1 : (long)left;
     if (f->ref < 0) return (long)f->count;
     l = (long long)v[f->ref] + f->adj;
     return l < 0 || l > PKT_MAX_LEN ? -1 : (long)l;
@@ -150,39 +155,58 @@ static void put(struct out *o, const char *fmt, ...)
     if (n > 0) o->len = o->len + (size_t)n < o->cap ? o->len + (size_t)n : o->cap - 1;
 }
 
-static void print_blob(struct out *out, const struct field *f, const uint8_t *p, long len)
+static void put_val(struct out *o, const struct fval *v)
 {
-    put(out, f->text ? " %s=\"" : " %s=[", f->name);
-    for (long i = 0; i < len; i++) {
-        if (!f->text) put(out, i ? " %02X" : "%02X", p[i]);
-        else if (p[i] == '"' || p[i] == '\\') put(out, "\\%c", p[i]);
-        else if (isprint(p[i])) put(out, "%c", p[i]);
-        else put(out, "\\x%02X", p[i]);
+    const struct field *f = v->f;
+    if (f->width && (f->is_const || f->crc)) {
+        put(o, "0x%0*lX", f->width * 2, (unsigned long)v->v);
+    } else if (f->width && f->sign) {
+        int sh = 32 - 8 * f->width;
+        put(o, "%ld", (long)((int32_t)(v->v << sh) >> sh));
+    } else if (f->width) {
+        put(o, "%lu", (unsigned long)v->v);
+    } else {
+        for (size_t i = 0; i < v->len; i++) {
+            uint8_t c = v->p[i];
+            if (!f->text) put(o, i ? " %02X" : "%02X", c);
+            else if (c == '"' || c == '\\') put(o, "\\%c", c);
+            else if (isprint(c)) put(o, "%c", c);
+            else put(o, "\\x%02X", c);
+        }
     }
-    put(out, f->text ? "\"" : "]");
 }
 
-/* Walks the packet at b; formats the fields when out is set. Same return as spec_match. */
-static long walk(const struct spec *s, const uint8_t *b, size_t n, struct out *out)
+void fval_str(const struct fval *v, char *buf, size_t cap)
+{
+    struct out o = {buf, cap, 0};
+    buf[0] = '\0';
+    put_val(&o, v);
+}
+
+/* Walks n bytes at b, filling vals (when set) with each field.
+ * Returns the byte count, -1 if they don't fit the spec, -2 if more bytes are needed. */
+static long walk(const struct spec *s, const uint8_t *b, size_t n, struct fval *vals)
 {
     uint32_t v[PKT_MAX_FIELDS];
     size_t start[PKT_MAX_FIELDS + 1], off = 0;
 
     for (int i = 0; i < s->n; i++) {
         const struct field *f = &s->f[i];
-        long len = flen(f, v);
+        long len = flen(f, v, n - off);
         start[i] = off;
         if (len < 0 || off + len > PKT_MAX_LEN) return -1;
-        if (off + len > n) return 0;
+        if (off + len > n) return -2;
         if (f->width) {
             v[i] = rd(b + off, f->width, f->be);
             if (f->is_const && v[i] != f->value) return -1;
             if (f->crc && v[i] != crc16_ccitt(b + start[f->crc_from], start[f->crc_to + 1] - start[f->crc_from]))
                 return -1;
-            if (f->is_const || f->crc) put(out, " %s=0x%0*lX", f->name, f->width * 2, (unsigned long)v[i]);
-            else put(out, " %s=%lu", f->name, (unsigned long)v[i]);
-        } else if (out) {
-            print_blob(out, f, b + off, len);
+        }
+        if (vals) {
+            vals[i].f = f;
+            vals[i].v = f->width ? v[i] : 0;
+            vals[i].p = b + off;
+            vals[i].len = (size_t)len;
         }
         off += len;
         start[i + 1] = off;
@@ -192,14 +216,27 @@ static long walk(const struct spec *s, const uint8_t *b, size_t n, struct out *o
 
 long spec_match(const struct spec *s, const uint8_t *buf, size_t n)
 {
-    return walk(s, buf, n, NULL);
+    long r = walk(s, buf, n, NULL);
+    return r == -2 ? 0 : r == 0 ? -1 : r; /* an empty match can't frame anything */
 }
 
-void spec_format(char *buf, size_t cap, const struct spec *s, const uint8_t *pkt)
+int spec_values(const struct spec *s, const uint8_t *b, size_t n, struct fval *out)
 {
+    return walk(s, b, n, out) >= 0 ? s->n : -1;
+}
+
+void spec_format(char *buf, size_t cap, const struct spec *s, const uint8_t *pkt, size_t n)
+{
+    struct fval v[PKT_MAX_FIELDS];
     struct out o = {buf, cap, 0};
     buf[0] = '\0';
-    walk(s, pkt, PKT_MAX_LEN, &o);
+    if (walk(s, pkt, n, v) < 0) return;
+    for (int i = 0; i < s->n; i++) {
+        const struct field *f = v[i].f;
+        put(&o, " %s=%s", f->name, f->width ? "" : f->text ? "\"" : "[");
+        put_val(&o, &v[i]);
+        put(&o, "%s", f->width ? "" : f->text ? "\"" : "]");
+    }
 }
 
 long spec_build(const struct spec *s, const char *args, uint8_t *out, size_t cap, char *err, size_t errlen)
@@ -227,7 +264,13 @@ long spec_build(const struct spec *s, const char *args, uint8_t *out, size_t cap
         set[i] = 1;
         if (f->width) {
             char *end;
-            v[i] = (uint32_t)strtoul(p, &end, 0);
+            if (f->sign) {
+                long sv = strtol(p, &end, 0), lim = 1L << (8 * f->width - 1);
+                if (f->width < 4 && (sv < -lim || sv >= lim)) FAIL("%s: value out of range", f->name);
+                v[i] = f->width < 4 ? (uint32_t)sv & ((1u << (8 * f->width)) - 1) : (uint32_t)sv;
+            } else {
+                v[i] = (uint32_t)strtoul(p, &end, 0);
+            }
             if (end == p || (*end && !isspace((unsigned char)*end))) FAIL("%s: bad number", f->name);
             p = end;
         } else {
@@ -258,7 +301,7 @@ long spec_build(const struct spec *s, const char *args, uint8_t *out, size_t cap
 
     for (int i = 0; i < s->n; i++) {
         const struct field *f = &s->f[i];
-        long len = flen(f, v);
+        long len = f->rest ? dlen[i] : flen(f, v, 0);
         start[i] = off;
         if (len < 0 || off + len > cap) FAIL("%s: length out of range", f->name);
         if (f->crc)

@@ -1,4 +1,5 @@
 #include "packet.h"
+#include "template.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -58,7 +59,7 @@ int main(void)
               == sizeof hello);
         CHECK(!memcmp(out, hello, sizeof hello));
         CHECK(spec_match(&s, out, sizeof hello) == sizeof hello);
-        spec_format(text, sizeof text, &s, out);
+        spec_format(text, sizeof text, &s, out, sizeof hello);
         CHECK(!strcmp(text, " sof=0xA5 flags=0 type=1 seq=1 len=6 payload=[00 01 00 00 00 01] crc=0x6AD2"));
         out[7] ^= 1; /* corrupt the payload: the crc no longer matches */
         CHECK(spec_match(&s, out, sizeof hello) == -1);
@@ -67,6 +68,71 @@ int main(void)
         CHECK(spec_parse(&s, "a:u8, c:crc16ccitt(a..b)", err, sizeof err) == -1);
         CHECK(spec_parse(&s, "a:u8, b:u8, c:crc16ccitt(b..a)", err, sizeof err) == -1);
         CHECK(spec_parse(&s, "a:u8, c:crc16ccitt(a..a)=1", err, sizeof err) == -1);
+    }
+
+    /* signed integers and a (*) blob that takes the rest */
+    {
+        struct fval v[PKT_MAX_FIELDS];
+        char text[128];
+        CHECK(spec_parse(&s, "t:i8, n:i16, rest:text(*)", err, sizeof err) == 0);
+        CHECK(spec_build(&s, "t=-61 n=-2 rest=\"hi\"", out, sizeof out, err, sizeof err) == 5);
+        CHECK(out[0] == 0xC3 && out[1] == 0xFE && out[2] == 0xFF && !memcmp(out + 3, "hi", 2));
+        CHECK(spec_build(&s, "t=-129", out, sizeof out, err, sizeof err) == -1);
+        spec_build(&s, "t=-61 n=-2 rest=\"hi\"", out, sizeof out, err, sizeof err);
+        spec_format(text, sizeof text, &s, out, 5);
+        CHECK(!strcmp(text, " t=-61 n=-2 rest=\"hi\""));
+        CHECK(spec_values(&s, out, 3, v) == 3 && v[2].len == 0); /* empty rest is fine */
+        CHECK(spec_values(&s, out, 2, v) == -1);                /* n cut short */
+        CHECK(spec_parse(&s, "a:bytes(*), b:u8", err, sizeof err) == -1);
+    }
+
+    /* templates: conditions, enums, a payload sub-spec, fallbacks */
+    {
+        static struct tmpl t;
+        static const uint8_t err_reply[] = {0xA5, 0x05, 0x02, 0x0C, 0x01, 0x00, 0x02};
+        static const uint8_t hello_resp[] = {0xA5, 0x01, 0x01, 0x01, 0x0A, 0x00, 0x00, 0x01, 0x00, 0x00,
+                                             0x00, 0x04, 0x60, 0x6D, 0x00, 0x00, 0xB2, 0x21};
+        char text[256];
+        CHECK(spec_parse(&s, "sof:u8=0xA5, flags:u8, type:u8, seq:u8, len:u16, payload:bytes(len),"
+                             "crc:crc16ccitt(flags..payload)", err, sizeof err) == 0);
+        CHECK(tmpl_parse(&t,
+                         "# comment\n"
+                         "enum type 1=HELLO 2=STATUS\n"
+                         "enum err 2=NO_HELLO\r\n"
+                         "when flags=5 \"#{seq} {type:type} error {code:err}\" payload: code:u8\n"
+                         "when type=1 flags=1 \"HELLO ok v{major}.{minor} heap={heap} {nope}\" "
+                         "payload: major:u8, minor:u8, caps:u16, max:u16, heap:u32\n"
+                         "when flags=1 \"{type:type} ok\"\n",
+                         err, sizeof err) == 0);
+        CHECK(t.nr == 3 && t.ne == 2);
+        CHECK(spec_build(&s, "flags=5 type=2 seq=12 payload=02", out, sizeof out, err, sizeof err) == 9);
+        CHECK(!memcmp(out, err_reply, 7)); /* header + payload as in the golden vector */
+        CHECK(tmpl_render(&t, &s, out, 9, text, sizeof text) == 1);
+        CHECK(!strcmp(text, "#12 STATUS error NO_HELLO"));
+        CHECK(tmpl_render(&t, &s, hello_resp, sizeof hello_resp, text, sizeof text) == 1);
+        CHECK(!strcmp(text, "HELLO ok v0.1 heap=28000 {nope}"));
+        /* payload too short for the HELLO sub-spec: falls through to the next rule */
+        {
+            uint8_t shortr[] = {0xA5, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0, 0};
+            uint16_t c = crc16_ccitt(shortr + 1, 6);
+            shortr[7] = (uint8_t)c;
+            shortr[8] = (uint8_t)(c >> 8);
+            CHECK(tmpl_render(&t, &s, shortr, sizeof shortr, text, sizeof text) == 1);
+            CHECK(!strcmp(text, "HELLO ok"));
+        }
+        /* no rule for a request (flags=0) */
+        CHECK(spec_build(&s, "type=2 seq=1", out, sizeof out, err, sizeof err) == 8);
+        CHECK(tmpl_render(&t, &s, out, 8, text, sizeof text) == 0);
+        /* enum value it doesn't list prints the number */
+        CHECK(spec_build(&s, "flags=5 type=9 payload=07", out, sizeof out, err, sizeof err) == 9);
+        CHECK(tmpl_render(&t, &s, out, 9, text, sizeof text) == 1 && !strcmp(text, "#0 9 error 7"));
+
+        CHECK(tmpl_parse(&t, "when x \"y\"\n", err, sizeof err) == -1);
+        CHECK(tmpl_parse(&t, "enum e 1\n", err, sizeof err) == -1);
+        CHECK(tmpl_parse(&t, "bogus\n", err, sizeof err) == -1);
+        CHECK(tmpl_parse(&t, "when a=1 \"unterminated\n", err, sizeof err) == -1);
+        CHECK(tmpl_parse(&t, "when a=1 \"x\" payload: q:u12\n", err, sizeof err) == -1);
+        CHECK(tmpl_parse(&t, "# nothing\n", err, sizeof err) == -1);
     }
 
     CHECK(unescape("a\\r\\n\\x41\\\\", '\0', out, sizeof out, NULL) == 5 && !memcmp(out, "a\r\nA\\", 5));

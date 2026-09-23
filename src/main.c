@@ -1,5 +1,6 @@
 #include "packet.h"
 #include "serial.h"
+#include "template.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -8,12 +9,13 @@
 #include <time.h>
 
 static const char usage_text[] =
-    "usage: serial-passthrough -a PORT[,BAUD[,FRAME[,FLOW]]] [-b PORT[,...]] [-p SPEC|FILE] [-q BYTES]\n"
+    "usage: serial-passthrough -a PORT[,BAUD[,FRAME[,FLOW]]] [-b PORT[,...]] [-p SPEC|FILE] [-t FILE] [-q BYTES]\n"
     "\n"
     "  -a, -b  serial ports, e.g. COM3,115200,8N1 or /dev/ttyUSB0,9600,7E1,rtscts\n"
     "          BAUD default 115200, FRAME <5-8><N|E|O|M|S><1|2> default 8N1, FLOW none|rtscts|xonxoff\n"
     "          without -b the app is the other end: type lines on stdin to send to A\n"
     "  -p      packet structure, e.g. \"sync:u8=0x02, msg:text(16), end:u8=0x03\" (or a file of it)\n"
+    "  -t      template file: show each packet as readable text (needs -p)\n"
     "  -q      queue size per direction in bytes (default 1048576, min 4096)\n"
     "\n"
     "stdin commands (single-device mode):\n"
@@ -39,6 +41,7 @@ struct dir {
 };
 
 static struct spec spec;
+static struct tmpl tmpl;
 
 /* script state (single-device mode) */
 static long long wait_until;   /* no commands before this */
@@ -46,6 +49,9 @@ static char expect_pat[256];   /* waiting for a received line matching this */
 static long long expect_by;
 static long expect_ms;
 static int quitting;
+/* device lines since the last send: a reply can beat the expect line that checks it */
+static char recent[16][1024];
+static int nrecent;
 
 static void usage(void)
 {
@@ -80,7 +86,10 @@ static int glob_in(const char *text, const char *pat)
 static void emit(const struct dir *d, const char *line)
 {
     puts(line);
+    if (d->from_device && nrecent < (int)(sizeof recent / sizeof *recent))
+        snprintf(recent[nrecent++], sizeof recent[0], "%s", line);
     if (expect_pat[0] && d->from_device && glob_in(line, expect_pat)) {
+        fflush(stdout); /* keep the ok after the line it matched */
         fprintf(stderr, "expect ok: %s\n", expect_pat);
         expect_pat[0] = '\0';
     }
@@ -130,7 +139,12 @@ static void decode(struct dir *d)
         if (junk) hexdump(d, "unframed ", d->pkt + pos - junk, junk);
         junk = 0;
         k = stamp(line, sizeof line, d->label);
-        spec_format(line + k, sizeof line - k, &spec, d->pkt + pos);
+        if (tmpl.nr && tmpl_render(&tmpl, &spec, d->pkt + pos, (size_t)r, line + k + 1, sizeof line - k - 3)) {
+            line[k] = ' ';
+            k += (int)strlen(line + k);
+            k += snprintf(line + k, sizeof line - k, "  |");
+        }
+        spec_format(line + k, sizeof line - k, &spec, d->pkt + pos, (size_t)r);
         emit(d, line);
         pos += (size_t)r;
     }
@@ -216,6 +230,13 @@ static void send_line(const char *line, struct dir *d)
         memcpy(expect_pat, end, len);
         expect_pat[len] = '\0';
         expect_by = now_ms() + expect_ms;
+        for (int i = 0; i < nrecent && expect_pat[0]; i++) {
+            if (glob_in(recent[i], expect_pat)) {
+                fflush(stdout);
+                fprintf(stderr, "expect ok: %s\n", expect_pat);
+                expect_pat[0] = '\0';
+            }
+        }
         return;
     }
     if (!strcmp(line, "quit")) {
@@ -237,22 +258,43 @@ static void send_line(const char *line, struct dir *d)
         fprintf(stderr, "not sent: %s\n", err);
         return;
     }
+    nrecent = 0; /* an expect after this send checks only replies to it */
     show(d, buf, (size_t)n);
     for (long i = 0; i < n; i++) d->q.buf[(d->q.head + d->q.len++) % d->q.cap] = buf[i];
 }
 
-static int load_spec(const char *arg)
+/* The contents of the file at arg, or arg itself if no such file (inline specs). */
+static const char *read_arg(const char *arg)
 {
     static char text[65536];
-    char err[160];
     FILE *f = fopen(arg, "r");
-    if (f) {
-        text[fread(text, 1, sizeof text - 1, f)] = '\0';
-        fclose(f);
-        arg = text;
-    }
-    if (spec_parse(&spec, arg, err, sizeof err)) {
+    if (!f) return arg;
+    text[fread(text, 1, sizeof text - 1, f)] = '\0';
+    fclose(f);
+    return text;
+}
+
+static int load_spec(const char *arg)
+{
+    char err[160];
+    if (spec_parse(&spec, read_arg(arg), err, sizeof err)) {
         fprintf(stderr, "packet spec: %s\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static int load_tmpl(const char *path)
+{
+    char err[200];
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "template: can't open %s\n", path);
+        return -1;
+    }
+    fclose(f);
+    if (tmpl_parse(&tmpl, read_arg(path), err, sizeof err)) {
+        fprintf(stderr, "template %s: %s\n", path, err);
         return -1;
     }
     return 0;
@@ -274,10 +316,11 @@ int main(int argc, char **argv)
         if (o[1] == 'a') cfg_a = v;
         else if (o[1] == 'b') cfg_b = v;
         else if (o[1] == 'p' && load_spec(v)) return 2;
+        else if (o[1] == 't' && load_tmpl(v)) return 2;
         else if (o[1] == 'q') qsize = strtoul(v, NULL, 0);
-        else if (o[1] != 'p') usage();
+        else if (o[1] != 'p' && o[1] != 't') usage();
     }
-    if (!cfg_a || qsize < PKT_MAX_LEN) usage();
+    if (!cfg_a || (tmpl.nr && !spec.n) || qsize < PKT_MAX_LEN) usage();
 
     ab.label = cfg_b ? "A>B" : "A>APP";
     ba.label = cfg_b ? "B>A" : "APP>A";

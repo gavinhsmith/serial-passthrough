@@ -11,11 +11,13 @@
 struct field {
     char name[32];
     int width;      /* 1, 2 or 4 for integers; 0 for blobs */
+    int sign;       /* integer is signed (i8/i16/i32) */
     int be;         /* integer is big-endian */
     int is_const;   /* integer must equal value (sync/end markers) */
     uint32_t value;
     int text;       /* blob prints as text instead of hex */
     size_t count;   /* blob: fixed byte count */
+    int rest;       /* blob: everything left, bytes(*)/text(*); last field only */
     int ref;        /* blob: index of the integer field holding its length, or -1 */
     long adj;       /* blob: added to the referenced length */
     int crc;        /* CRC-16/CCITT-FALSE over fields crc_from..crc_to, computed */
@@ -27,16 +29,30 @@ struct spec {
     int n;
 };
 
+/* One decoded field: an integer (width > 0) or a blob (p, len). */
+struct fval {
+    const struct field *f;
+    uint32_t v;
+    const uint8_t *p;
+    size_t len;
+};
+
 /* Parse "name:type[=value]" fields separated by commas or newlines; '#' starts a comment.
- * Types: u8, u16[le|be], u32[le|be], bytes(N), text(N), bytes(field[+-N]), text(field[+-N]),
- * crc16ccitt(first..last)[le|be]. */
+ * Types: u8/i8, u16/i16[le|be], u32/i32[le|be], bytes(N), text(N), bytes(field[+-N]), text(field[+-N]),
+ * bytes(*)/text(*) (the rest; last field), crc16ccitt(first..last)[le|be]. */
 int spec_parse(struct spec *s, const char *text, char *err, size_t errlen);
 
 /* > 0: a whole packet of that many bytes starts at buf; 0: need more bytes; -1: no packet starts here. */
 long spec_match(const struct spec *s, const uint8_t *buf, size_t n);
 
-/* Format the fields of a packet spec_match() accepted into buf, each preceded by a space. */
-void spec_format(char *buf, size_t cap, const struct spec *s, const uint8_t *pkt);
+/* Format the fields of an n-byte packet spec_match() accepted into buf, each preceded by a space. */
+void spec_format(char *buf, size_t cap, const struct spec *s, const uint8_t *pkt, size_t n);
+
+/* Decode n bytes into one fval per field. Returns the field count, or -1 if the bytes don't fit. */
+int spec_values(const struct spec *s, const uint8_t *b, size_t n, struct fval *out);
+
+/* A value on its own: integers in decimal (hex for constants and CRCs), text escaped, bytes as hex. */
+void fval_str(const struct fval *v, char *buf, size_t cap);
 
 /* CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection. "123456789" -> 0x29B1. */
 uint16_t crc16_ccitt(const uint8_t *p, size_t n);

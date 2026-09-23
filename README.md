@@ -12,13 +12,14 @@ device A <──> [ serial-passthrough ] <──> device B
 ## Usage
 
 ```
-serial-passthrough -a PORT[,BAUD[,FRAME[,FLOW]]] [-b PORT[,...]] [-p SPEC|FILE] [-q BYTES]
+serial-passthrough -a PORT[,BAUD[,FRAME[,FLOW]]] [-b PORT[,...]] [-p SPEC|FILE] [-t FILE] [-q BYTES]
 ```
 
 | Option | |
 |---|---|
 | `-a`, `-b` | Ports with their own settings, e.g. `COM3,115200,8N1` or `/dev/ttyUSB0,9600,7E1,rtscts`. BAUD default `115200`, FRAME `<5-8><N\|E\|O\|M\|S><1\|2>` default `8N1`, FLOW `none\|rtscts\|xonxoff`. |
 | `-p` | Packet structure (see below), inline or a file containing it. |
+| `-t` | Template file that turns each packet into readable text (see [Templates](#templates)). Needs `-p`. |
 | `-q` | Queue size per direction in bytes (default 1 MiB, min 4096). |
 
 ```sh
@@ -76,10 +77,11 @@ Fields separated by commas or newlines, `#` starts a comment:
 
 | Type | |
 |---|---|
-| `name:u8`, `u16`, `u32` | Integer, little-endian by default; add `be`/`le` (`u16be`). |
+| `name:u8`, `u16`, `u32` | Integer, little-endian by default; add `be`/`le` (`u16be`). `i8`, `i16`, `i32` are signed. |
 | `name:u8=0x02` | Constant: used to find where packets start (and end). |
 | `name:bytes(16)` / `name:text(16)` | Fixed-size blob, shown as hex / as text. |
 | `name:bytes(len)` / `name:text(len-2)` | Size taken from an earlier integer field, with an optional `+N`/`-N` adjustment. |
+| `name:bytes(*)` / `name:text(*)` | Everything left; must be the last field. Meant for template sub-specs, where the size is known. |
 | `name:crc16ccitt(first..last)` | CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over fields `first` through `last`, little-endian unless `be`. Checked when decoding, computed by `pkt`. |
 
 ```
@@ -92,6 +94,37 @@ crc:crc16ccitt(len..payload)
 
 Bytes that don't fit the structure (including a bad CRC) are shown as `unframed` and the decoder resyncs on the next byte.
 Only display is affected; the bytes are always forwarded unchanged. Packets are capped at 4096 bytes.
+
+## Templates
+
+A template (`-t FILE`) turns each decoded packet into a readable line. It shows first, followed by `|` and the
+raw fields, so `expect` patterns written against the raw fields keep working:
+
+```
+04:25:45.420 A>APP  #4 STATUS wifi=CONNECTED rssi=-56 ip=192.168.0.7  | sof=0xA5 flags=1 type=2 seq=4 ...
+```
+
+One rule per line, `#` lines are comments, and the first rule that matches wins. Packets no rule matches show
+only the raw fields.
+
+```
+enum NAME VALUE=LABEL ...
+when FIELD=VALUE ... "FORMAT" [BLOB: SUBSPEC]
+```
+
+- `when` conditions compare integer fields of the packet spec. With none, the rule matches every packet.
+- `FORMAT` is text with `{field}` placeholders. `{field:NAME}` shows an integer through enum `NAME`, falling
+  back to the number for values it doesn't list. A name no field has is left as written.
+- `BLOB: SUBSPEC` decodes the bytes of blob field `BLOB` with a packet spec of its own (same field syntax,
+  commas between fields), and its fields can be used in `FORMAT` too. If the bytes are too short for the
+  sub-spec, the rule doesn't match and the next one is tried. Extra bytes are ignored.
+
+```
+enum err 1=UNSUPPORTED 2=NO_HELLO
+when flags=5 "#{seq} error {code:err}" payload: code:u8
+when flags=1 type=2 "#{seq} STATUS rssi={rssi} ip={a}.{b}.{c}.{d}" payload: state:u8, slot:u8, rssi:i8, a:u8, b:u8, c:u8, d:u8
+when flags=1 type=33 "#{seq} BODY @{off}: {data}" payload: off:u32, eof:u8, data:text(*)
+```
 
 ## Build
 
